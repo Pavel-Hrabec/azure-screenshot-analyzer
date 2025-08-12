@@ -1,0 +1,12 @@
+{
+  "name": "screenshot-func",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@azure/storage-blob": "^12.18.0",
+    "playwright": "^1.46.0"
+  },
+  "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium"
+  }
+}
