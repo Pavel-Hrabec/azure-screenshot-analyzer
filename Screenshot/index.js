@@ -1,55 +1,51 @@
 import { chromium } from "playwright";
-import {
-  BlobServiceClient,
-  StorageSharedKeyCredential,
-  generateBlobSASQueryParameters,
-  BlobSASPermissions
-} from "@azure/storage-blob";
-
-// App settings v Function App:
-// AzureWebJobsStorage  (automaticky nastaveno Function Appem)
-// SCREENSHOT_CONTAINER (např. "screenshots")
-// SAS_EXP_MINUTES      (volitelné, default 15)
+import { BlobServiceClient } from "@azure/storage-blob";
 
 export default async function (context, req) {
-  try {
-    const url = req.query.url || (req.body && req.body.url);
-    if (!url) return { status: 400, body: "Missing ?url or body.url" };
+  const bad = (status, msg) => ({
+    status,
+    headers: { "Content-Type": "application/json" },
+    body: { ok: false, error: msg },
+  });
 
-    // 1) Screenshot
-    const browser = await chromium.launch({ args: ["--no-sandbox"] });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-    const buffer = await page.screenshot({ fullPage: true, type: "png" });
+  try {
+    const url = (req.query?.url || req.body?.url || "").trim();
+    if (!url) return bad(400, "Missing 'url'.");
+
+    let target;
+    try { target = new URL(url); } catch { return bad(400, "Invalid URL."); }
+    if (target.protocol !== "https:") return bad(400, "Only https URLs are allowed.");
+
+    // Take screenshot
+    const browser = await chromium.launch({ args: ["--no-sandbox"], headless: true });
+    const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    const page = await ctx.newPage();
+    await page.goto(target.href, { waitUntil: "networkidle", timeout: 30000 });
+    const png = await page.screenshot({ fullPage: true, type: "png" });
     await browser.close();
 
-    // 2) Upload to Blob
-    const conn = process.env.AzureWebJobsStorage;
+    // Upload
+    const conn = process.env.BLOB_CONN || process.env.AzureWebJobsStorage;
+    if (!conn) return bad(500, "Storage connection not configured.");
     const containerName = process.env.SCREENSHOT_CONTAINER || "screenshots";
-    const bsc = BlobServiceClient.fromConnectionString(conn);
-    const container = bsc.getContainerClient(containerName);
-    await container.createIfNotExists();
+    const fileNameSafeHost = target.hostname.replace(/[^a-z0-9.-]/gi, "-");
+    const blobName = `${Date.now()}_${fileNameSafeHost}.png`;
 
-    const blobName = `shot_${Date.now()}.png`;
-    const blobClient = container.getBlockBlobClient(blobName);
-    await blobClient.uploadData(buffer, { blobHTTPHeaders: { blobContentType: "image/png" } });
+    const svc = BlobServiceClient.fromConnectionString(conn);
+    const container = svc.getContainerClient(containerName);
 
-    // 3) SAS (krátká platnost)
-    const { accountName, accountKey } = BlobServiceClient.parseConnectionString(conn);
-    const sharedKey = new StorageSharedKeyCredential(accountName, accountKey);
-    const expiresOn = new Date(Date.now() + 1000 * 60 * (parseInt(process.env.SAS_EXP_MINUTES || "15", 10)));
-    const sas = generateBlobSASQueryParameters(
-      { containerName, blobName, permissions: BlobSASPermissions.parse("r"), startsOn: new Date(Date.now() - 60 * 1000), expiresOn },
-      sharedKey
-    ).toString();
+    // If you want public URLs (no SAS), use access: 'blob'
+    await container.createIfNotExists({ access: "blob" }); // change to 'private' if you don’t want public
+    const blob = container.getBlockBlobClient(blobName);
+    await blob.uploadData(png, { blobHTTPHeaders: { blobContentType: "image/png" } });
 
     return {
       status: 200,
       headers: { "Content-Type": "application/json" },
-      body: { ok: true, blobUrl: blobClient.url, sasUrl: `${blobClient.url}?${sas}`, expiresOn: expiresOn.toISOString() }
+      body: { ok: true, blobUrl: blob.url },
     };
   } catch (err) {
     context.log.error(err);
-    return { status: 500, body: `Error: ${err.message}` };
+    return { status: 500, headers: { "Content-Type": "application/json" }, body: { ok: false, error: err.message } };
   }
 }
